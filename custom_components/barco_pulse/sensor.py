@@ -1,6 +1,8 @@
-"""Platform for sensor integration."""
+"""Temperatures, signal, resolution and state."""
 
-import logging
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -8,137 +10,113 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfTemperature
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.const import EntityCategory, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import device as d
 from .coordinator import BarcoConfigEntry
-from .device import (
-    DEVICE_INLET_T,
-    DEVICE_INPUT_ACTIVE,
-    DEVICE_INPUT_SIGNAL,
-    DEVICE_LASER_STATUS,
-    DEVICE_MAINBOARD_T,
-    DEVICE_OUTLET_T,
-    DEVICE_OUTPUT_HRES,
-    DEVICE_OUTPUT_RES,
-    DEVICE_OUTPUT_VRES,
-    DEVICE_SYSTEM_STATE,
-    DEVICE_SYSTEM_TARGETSTATE,
-)
-from .entity import BarcoEntity
+from .entity import BarcoValueEntity, BarcoValueMixin
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-SENSOR_INLET_T = "inlet_temp"
-SENSOR_OUTLET_T = "outlet_temp"
-SENSOR_MAINBOARD_T = "mainboard_temp"
-SENSOR_INPUT_ACTIVE = "input_active"
-SENSOR_INPUT_SIGNAL = "input_signal"
-SENSOR_OUTPUT_RES = "output_res"
-SENSOR_OUTPUT_HRES = "output_hres"
-SENSOR_OUTPUT_VRES = "output_vres"
-SENSOR_LASER_STATUS = "laser_state"
-SENSOR_SYSTEM_STATE = "system_state"
-SENSOR_SYSTEM_TARGETSTATE = "system_targetstate"
 
-BARCO_SENSOR_MAP = {
-    SENSOR_INLET_T: DEVICE_INLET_T,
-    SENSOR_OUTLET_T: DEVICE_OUTLET_T,
-    SENSOR_MAINBOARD_T: DEVICE_MAINBOARD_T,
-    SENSOR_INPUT_ACTIVE: DEVICE_INPUT_ACTIVE,
-    SENSOR_INPUT_SIGNAL: DEVICE_INPUT_SIGNAL,
-    SENSOR_LASER_STATUS: DEVICE_LASER_STATUS,
-    SENSOR_OUTPUT_VRES: DEVICE_OUTPUT_VRES,
-    SENSOR_OUTPUT_HRES: DEVICE_OUTPUT_HRES,
-    SENSOR_OUTPUT_RES: DEVICE_OUTPUT_RES,
-    SENSOR_SYSTEM_STATE: DEVICE_SYSTEM_STATE,
-    SENSOR_SYSTEM_TARGETSTATE: DEVICE_SYSTEM_TARGETSTATE,
-}
+@dataclass(frozen=True, kw_only=True)
+class BarcoSensorDescription(BarcoValueMixin, SensorEntityDescription):
+    """A projector reading."""
 
-SENSOR_DESCRIPTIONS = (
-    SensorEntityDescription(
-        key=SENSOR_INLET_T,
-        translation_key=SENSOR_INLET_T,
-        native_unit_of_measurement=UnitOfTemperature.FAHRENHEIT,
+
+def _temperature(key: str, data_key: str) -> BarcoSensorDescription:
+    return BarcoSensorDescription(
+        key=key,
+        translation_key=key,
         device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT
-    ),
-    SensorEntityDescription(
-        key=SENSOR_MAINBOARD_T,
-        translation_key=SENSOR_MAINBOARD_T,
-        native_unit_of_measurement=UnitOfTemperature.FAHRENHEIT,
-        device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT
-    ),
-    SensorEntityDescription(
-        key=SENSOR_INPUT_SIGNAL,
-        translation_key=SENSOR_INPUT_SIGNAL,
-        device_class=SensorDeviceClass.ENUM,
-    ),
-    SensorEntityDescription(
-        key=SENSOR_OUTLET_T,
-        translation_key=SENSOR_OUTLET_T,
-        native_unit_of_measurement=UnitOfTemperature.FAHRENHEIT,
-        device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT
-    ),
-    SensorEntityDescription(
-        key=SENSOR_OUTPUT_HRES,
-        translation_key=SENSOR_OUTPUT_HRES,
-        device_class="pixels",
-        state_class=SensorStateClass.MEASUREMENT
-    ),
-    SensorEntityDescription(
-        key=SENSOR_OUTPUT_VRES,
-        translation_key=SENSOR_OUTPUT_VRES,
-        device_class="lines",
-        state_class=SensorStateClass.MEASUREMENT
-    ),
-    SensorEntityDescription(
-        key=SENSOR_OUTPUT_RES,
-        translation_key=SENSOR_OUTPUT_RES,
-        device_class=SensorDeviceClass.ENUM,
-    ),
-    SensorEntityDescription(
-        key=SENSOR_LASER_STATUS,
-        translation_key=SENSOR_LASER_STATUS,
-        device_class=SensorDeviceClass.ENUM,
-    ),
-    SensorEntityDescription(
-        key=SENSOR_SYSTEM_STATE,
-        translation_key=SENSOR_SYSTEM_STATE,
-        device_class=SensorDeviceClass.ENUM,
-    ),
-    SensorEntityDescription(
-        key=SENSOR_SYSTEM_TARGETSTATE,
-        translation_key=SENSOR_SYSTEM_TARGETSTATE,
-        device_class=SensorDeviceClass.ENUM,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=lambda data: data.get(data_key),
     )
+
+
+SENSORS = (
+    _temperature("inlet_temp", d.INLET_T),
+    _temperature("outlet_temp", d.OUTLET_T),
+    _temperature("mainboard_temp", d.MAINBOARD_T),
+    BarcoSensorDescription(
+        key="input_signal",
+        translation_key="input_signal",
+        value_fn=lambda data: data.get(d.INPUT_SIGNAL),
+    ),
+    BarcoSensorDescription(
+        key="output_res",
+        translation_key="output_res",
+        value_fn=lambda data: data.get(d.OUTPUT_RES),
+    ),
+    BarcoSensorDescription(
+        key="output_hres",
+        translation_key="output_hres",
+        native_unit_of_measurement="px",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.get(d.OUTPUT_HRES),
+    ),
+    BarcoSensorDescription(
+        key="output_vres",
+        translation_key="output_vres",
+        native_unit_of_measurement="px",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.get(d.OUTPUT_VRES),
+    ),
+    BarcoSensorDescription(
+        key="laser_state",
+        translation_key="laser_state",
+        value_fn=lambda data: data.get(d.LASER_STATUS),
+    ),
+    BarcoSensorDescription(
+        key="system_state",
+        translation_key="system_state",
+        device_class=SensorDeviceClass.ENUM,
+        options=d.STATES,
+        value_fn=lambda data: data.get(d.SYSTEM_STATE),
+    ),
+    BarcoSensorDescription(
+        key="system_targetstate",
+        translation_key="system_targetstate",
+        device_class=SensorDeviceClass.ENUM,
+        options=d.STATES,
+        value_fn=lambda data: data.get(d.SYSTEM_TARGETSTATE),
+    ),
+    BarcoSensorDescription(
+        key="health",
+        translation_key="health",
+        device_class=SensorDeviceClass.ENUM,
+        options=[s.lower() for s in d.HEALTH_STATES],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: (data.get(d.SYSTEM_HEALTH) or "").lower() or None,
+    ),
 )
 
-async def async_setup_entry(hass: HomeAssistant,
-                            config_entry: BarcoConfigEntry,
-                            async_add_entities: AddEntitiesCallback) -> None:
-    """Add sensors for passed config_entry in HA."""
-    coord = config_entry.runtime_data
-    new_entities = [BarcoSensor(coord, desc) for desc in SENSOR_DESCRIPTIONS]
-    if new_entities:
-        async_add_entities(new_entities)
 
-class BarcoSensor(SensorEntity, BarcoEntity):
-    """Sensor class."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: BarcoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add the sensors."""
+    async_add_entities(BarcoSensor(entry.runtime_data, desc) for desc in SENSORS)
+
+
+class BarcoSensor(BarcoValueEntity, SensorEntity):
+    """A projector reading."""
+
+    entity_description: BarcoSensorDescription
 
     @property
-    def available(self) -> bool:
-        """Return online state."""
-        dev_sensor = BARCO_SENSOR_MAP[self.entity_description.key]
-        return self.coordinator.device.get_sensor_value(dev_sensor) is not None
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-
-        dev_sensor = BARCO_SENSOR_MAP[self.entity_description.key]
-        self._attr_native_value = self.coordinator.device.get_sensor_value(dev_sensor)
-        self.async_write_ha_state()
+    def native_value(self):
+        """The reading; enum values outside the known set are reported as unknown."""
+        value = self._value
+        options = self.entity_description.options
+        if options is not None and value not in options:
+            return None
+        return value

@@ -1,6 +1,8 @@
-"""Media player platform for Barco Pulse."""
+"""The projector as a media player: power and input."""
 
-import logging
+from __future__ import annotations
+
+from typing import Any
 
 from homeassistant.components.media_player import (
     MediaPlayerDeviceClass,
@@ -8,83 +10,80 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityDescription,
     MediaPlayerEntityFeature,
     MediaPlayerState,
-    MediaType,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .coordinator import BarcoConfigEntry, BarcoCoordinator
+from . import device as d
+from .coordinator import BarcoConfigEntry
 from .entity import BarcoEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-DESC = MediaPlayerEntityDescription(key="projector", translation_key="projector")
+DESCRIPTION = MediaPlayerEntityDescription(key="projector", name=None)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: BarcoConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: BarcoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Add Remote entity."""
-    coord = config_entry.runtime_data
-
-    async_add_entities([BarcoMediaPlayer(coord)])
+    """Add the player."""
+    async_add_entities([BarcoMediaPlayer(entry.runtime_data, DESCRIPTION)])
 
 
-class BarcoMediaPlayer(MediaPlayerEntity, BarcoEntity):
-    """Projector as media_player."""
+class BarcoMediaPlayer(BarcoEntity, MediaPlayerEntity):
+    """Power and input.
+
+    Always available: an asleep projector is off the network, and turning the
+    player on is what wakes it (wake-on-LAN).
+    """
 
     _attr_device_class = MediaPlayerDeviceClass.TV
     _attr_supported_features = (
-        MediaPlayerEntityFeature.SELECT_SOURCE
+        MediaPlayerEntityFeature.TURN_ON
         | MediaPlayerEntityFeature.TURN_OFF
-        | MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.SELECT_SOURCE
     )
-    _attr_media_content_type = MediaType.MOVIE
-    _supports_source = True
-
-    def __init__(self, coord: BarcoCoordinator) -> None:
-        """Get going."""
-        super().__init__(coord, DESC)
 
     @property
     def available(self) -> bool:
-        """Is device online."""
-        return self.coordinator.device.online
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if entity is on."""
-        return self.coordinator.device.is_on
-
-    @property
-    def source_list(self) -> list[str]:
-        """Source list."""
-        return self.coordinator.device.source_list
-
-    @property
-    def source(self) -> str:
-        """Current source."""
-        return self.coordinator.device.source
-
-    async def async_select_source(self, source: str):
-        """Change source."""
-        await self.coordinator.device.select_source(source)
-
-    async def async_turn_on(self) -> None:
-        """Turn the device on."""
-        await self.coordinator.device.turn_on()
-
-    async def async_turn_off(self) -> None:
-        """Turn the device off."""
-        await self.coordinator.device.turn_off()
+        """Always, so the projector can be woken."""
+        return True
 
     @property
     def state(self) -> MediaPlayerState:
-        """Current state."""
-        return MediaPlayerState.ON if self.is_on else MediaPlayerState.IDLE
+        """On while the laser is on or warming up; otherwise off."""
+        return MediaPlayerState.ON if self.coordinator.device.is_on else MediaPlayerState.OFF
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self.schedule_update_ha_state()
+    @property
+    def source_list(self) -> list[str] | None:
+        """The projector's inputs."""
+        return self.coordinator.data.get(d.SOURCE_LIST)
+
+    @property
+    def source(self) -> str | None:
+        """The main window's input, while connected."""
+        return self.coordinator.data.get(d.INPUT_SOURCE)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The projector's own state names."""
+        data = self.coordinator.data
+        return {
+            "system_state": data.get(d.SYSTEM_STATE)
+            or ("eco" if self.coordinator.device.sleeping else None),
+            "target_state": data.get(d.SYSTEM_TARGETSTATE),
+        }
+
+    async def async_turn_on(self) -> None:
+        """Power on; wakes the projector from eco mode first if needed."""
+        await self._async_run(self.coordinator.device.async_turn_on())
+
+    async def async_turn_off(self) -> None:
+        """Power off."""
+        await self._async_run(self.coordinator.device.async_turn_off())
+
+    async def async_select_source(self, source: str) -> None:
+        """Switch input."""
+        await self._async_run(self.coordinator.device.async_select_source(source))

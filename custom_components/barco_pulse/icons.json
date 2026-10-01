@@ -1,0 +1,19 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "laser": { "default": "mdi:laser-pointer" },
+      "illumination": { "default": "mdi:lightbulb-outline", "state": { "on": "mdi:lightbulb-on" } },
+      "input_active": { "default": "mdi:video-input-hdmi" }
+    },
+    "sensor": {
+      "input_signal": { "default": "mdi:video-input-hdmi" },
+      "output_res": { "default": "mdi:monitor-screenshot" },
+      "output_hres": { "default": "mdi:arrow-expand-horizontal" },
+      "output_vres": { "default": "mdi:arrow-expand-vertical" },
+      "laser_state": { "default": "mdi:laser-pointer" },
+      "system_state": { "default": "mdi:projector" },
+      "system_targetstate": { "default": "mdi:projector" },
+      "health": { "default": "mdi:heart-pulse" }
+    }
+  }
+}

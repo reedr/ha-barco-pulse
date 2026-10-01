@@ -1,61 +1,77 @@
-"""Platform for BinarySensor integration."""
+"""Laser, illumination, input signal and health."""
 
-import logging
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import device as d
 from .coordinator import BarcoConfigEntry
-from .device import DEVICE_ILLUM_ON, DEVICE_LASER_ON
-from .entity import BarcoEntity
+from .entity import BarcoValueEntity, BarcoValueMixin
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-SENSOR_LASER_ON = "laser"
-SENSOR_ILLUM_ON = "illumination"
 
-SENSOR_MAP = {
-    SENSOR_LASER_ON: DEVICE_LASER_ON,
-    SENSOR_ILLUM_ON: DEVICE_ILLUM_ON
-}
+@dataclass(frozen=True, kw_only=True)
+class BarcoBinaryDescription(BarcoValueMixin, BinarySensorEntityDescription):
+    """An on/off projector reading."""
 
-SENSOR_DESCRIPTIONS = (
-        BinarySensorEntityDescription(
-        key=SENSOR_LASER_ON,
-        translation_key=SENSOR_LASER_ON
+
+def _health_problem(data: dict) -> bool | None:
+    health = data.get(d.SYSTEM_HEALTH)
+    return None if health is None else health != "Normal"
+
+
+BINARY_SENSORS = (
+    BarcoBinaryDescription(
+        key="laser",
+        translation_key="laser",
+        value_fn=lambda data: data.get(d.LASER_ON),
     ),
-    BinarySensorEntityDescription(
-        key=SENSOR_ILLUM_ON,
-        translation_key=SENSOR_ILLUM_ON
-    )
+    BarcoBinaryDescription(
+        key="illumination",
+        translation_key="illumination",
+        value_fn=lambda data: data.get(d.ILLUM_ON),
+    ),
+    BarcoBinaryDescription(
+        key="input_active",
+        translation_key="input_active",
+        value_fn=lambda data: data.get(d.INPUT_ACTIVE),
+    ),
+    BarcoBinaryDescription(
+        key="health_problem",
+        translation_key="health_problem",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_health_problem,
+    ),
 )
 
-async def async_setup_entry(hass: HomeAssistant,
-                            config_entry: BarcoConfigEntry,
-                            async_add_entities: AddEntitiesCallback) -> None:
-    """Add BinarySensors for passed config_entry in HA."""
-    coord = config_entry.runtime_data
-    new_entities = [BarcoBinarySensor(coord, desc) for desc in SENSOR_DESCRIPTIONS]
-    if new_entities:
-        async_add_entities(new_entities)
 
-class BarcoBinarySensor(BinarySensorEntity, BarcoEntity):
-    """BinarySensor class."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: BarcoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add the binary sensors."""
+    async_add_entities(BarcoBinarySensor(entry.runtime_data, desc) for desc in BINARY_SENSORS)
+
+
+class BarcoBinarySensor(BarcoValueEntity, BinarySensorEntity):
+    """An on/off projector reading."""
+
+    entity_description: BarcoBinaryDescription
 
     @property
-    def available(self) -> bool:
-        """Return online state."""
-        dev_sensor = SENSOR_MAP[self.entity_description.key]
-        return self.coordinator.device.get_sensor_value(dev_sensor) is not None
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-
-        dev_sensor = SENSOR_MAP[self.entity_description.key]
-        self._attr_is_on = self.coordinator.device.get_sensor_value(dev_sensor)
-        self.async_write_ha_state()
+    def is_on(self) -> bool | None:
+        """The reading."""
+        value = self._value
+        return None if value is None else bool(value)

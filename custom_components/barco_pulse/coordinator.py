@@ -1,63 +1,84 @@
-"""Coordinator."""
+"""Coordinator for a Barco Pulse projector."""
 
-from datetime import timedelta
+from __future__ import annotations
+
 import logging
-from typing import Self
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .device import BarcoDevice
+from .const import DOMAIN, UPDATE_INTERVAL
+from .device import (
+    SYSTEM_FIRMWARE,
+    SYSTEM_MODEL,
+    SYSTEM_SERIAL,
+    BarcoDevice,
+    BarcoError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-class BarcoCoordinator(DataUpdateCoordinator):
-    """My custom coordinator."""
+type BarcoConfigEntry = ConfigEntry[BarcoCoordinator]
+
+
+class BarcoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Relays the projector's pushed changes; polls to reconnect and to notice wake-ups.
+
+    An unreachable projector is normally just asleep (eco mode takes it off the
+    network), so a failed poll isn't an error: the readings clear and go
+    unavailable, while the player stays available so it can wake the projector.
+    """
+
+    config_entry: BarcoConfigEntry
 
     def __init__(
-        self, hass: HomeAssistant, config_entry: ConfigEntry[Self], device: BarcoDevice
+        self, hass: HomeAssistant, config_entry: BarcoConfigEntry, device: BarcoDevice
     ) -> None:
-        """Initialize my coordinator."""
+        """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
-            # Name of the data. For logging purposes.
-            name="Barco Coordinator",
             config_entry=config_entry,
-            update_interval=timedelta(seconds=30),
-            setup_method=self.async_init,
-            update_method=self._async_update_data,
+            name=f"Barco {device.host}",
+            update_interval=UPDATE_INTERVAL,
             always_update=False,
         )
-        self._device = device
+        self.device = device
+        self._identity: tuple | None = None
+        device.set_callback(self._handle_push)
 
-    @property
-    def device(self) -> BarcoDevice:
-        """The device handle."""
-        return self._device
-
-    async def async_init(self):
-        """Init the device."""
-        await self.device.async_init(self.update_callback)
-
-    async def _async_update_data(self):
-        """Polling update."""
-
-        dev_is_online = self.device.online
+    async def _async_update_data(self) -> dict[str, Any]:
         try:
-            await self.device.update_data()
-        except Exception as err:
-            if dev_is_online:
-                _LOGGER.error("Data update failed: %s", err)
-                raise UpdateFailed(err) from err
-            else:
-                _LOGGER.info("Projector may be asleep.  Ignoring: %s", err)
+            await self.device.async_poll()
+        except (BarcoError, OSError, TimeoutError) as err:
+            _LOGGER.debug("Poll of %s: %s", self.device.host, err)
         return self.device.data
 
     @callback
-    def update_callback(self, data):
-        """Incoming data callback."""
-        self.hass.add_job(self.async_set_updated_data, data)
+    def _handle_push(self, data: dict[str, Any]) -> None:
+        self.async_set_updated_data(data)
+        self._update_device_registry(data)
 
-type BarcoConfigEntry = ConfigEntry[Self]
+    @callback
+    def _update_device_registry(self, data: dict[str, Any]) -> None:
+        """Fill in model, serial and firmware once the projector has reported them."""
+        identity = (data.get(SYSTEM_MODEL), data.get(SYSTEM_SERIAL), data.get(SYSTEM_FIRMWARE))
+        if identity == self._identity or not any(identity):
+            return
+        dev_reg = dr.async_get(self.hass)
+        device = dev_reg.async_get_device_by_identifier(
+            (DOMAIN, self.device.mac), self.config_entry.entry_id
+        )
+        if device is None:
+            return
+        self._identity = identity
+        model, serial, firmware = identity
+        dev_reg.async_update_device(
+            device.id,
+            model=model or device.model,
+            serial_number=serial or device.serial_number,
+            sw_version=firmware or device.sw_version,
+        )

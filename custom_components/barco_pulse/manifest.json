@@ -1,14 +1,13 @@
 {
-  "domain": "Barco",
+  "domain": "barco_pulse",
   "name": "Barco Pulse",
-  "version": "0.1.0",
-  "integration_type": "device",
-  "codeowners": [
-    "@reedr"
-  ],
+  "codeowners": ["@reedr"],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/barco",
-  "iot_class": "local_polling",
-  "quality_scale": "bronze",
-  "requirements": ["py2n==0.4.2"]
+  "documentation": "https://github.com/reedr/ha-barco-pulse",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/reedr/ha-barco-pulse/issues",
+  "loggers": ["custom_components.barco_pulse"],
+  "requirements": ["wakeonlan==3.3.0"],
+  "version": "1.0.0"
 }

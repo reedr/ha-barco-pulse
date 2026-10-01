@@ -1,0 +1,106 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "menu_options": {
+          "import_legacy": "Import the existing projector",
+          "manual": "Set up a projector"
+        },
+        "description": "The projector must be awake (not in eco mode) to be added.",
+        "data": {
+          "host": "Host",
+          "mac": "MAC address",
+          "pin_code": "PIN code"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the projector.",
+          "mac": "Used to wake the projector from eco mode (wake-on-LAN).",
+          "pin_code": "The projector's control PIN, if one is set. Without it the projector can be monitored but not controlled."
+        }
+      },
+      "import_legacy": {
+        "description": "Import {count} projector(s) from the old Barco Pulse package: {titles}. Entity IDs, names and history are kept."
+      },
+      "reconfigure": {
+        "data": {
+          "host": "Host",
+          "mac": "MAC address",
+          "pin_code": "PIN code"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the projector.",
+          "mac": "Used to wake the projector from eco mode (wake-on-LAN).",
+          "pin_code": "The projector's control PIN, if one is set."
+        }
+      }
+    },
+    "error": {
+      "asleep": "The projector is in eco mode. Wake it (for example with its remote) and try again.",
+      "cannot_connect": "Could not connect to the projector.",
+      "invalid_auth": "The projector rejected this PIN code.",
+      "invalid_mac": "Not a MAC address.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This projector is already set up.",
+      "invalid_legacy_entry": "The old entry's MAC address isn't valid; set the projector up manually.",
+      "no_legacy_entry": "There is nothing to import.",
+      "reconfigure_successful": "The settings were updated.",
+      "wrong_device": "That is a different projector."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "laser": { "name": "Laser" },
+      "illumination": { "name": "Illumination" },
+      "input_active": { "name": "HDMI signal" },
+      "health_problem": { "name": "Health problem" }
+    },
+    "sensor": {
+      "inlet_temp": { "name": "Inlet temperature" },
+      "outlet_temp": { "name": "Outlet temperature" },
+      "mainboard_temp": { "name": "Mainboard temperature" },
+      "input_signal": { "name": "Input signal" },
+      "output_res": { "name": "Output resolution" },
+      "output_hres": { "name": "Output width" },
+      "output_vres": { "name": "Output height" },
+      "laser_state": { "name": "Laser state" },
+      "system_state": {
+        "name": "State",
+        "state": {
+          "boot": "Booting",
+          "eco": "Eco",
+          "standby": "Standby",
+          "ready": "Ready",
+          "conditioning": "Warming up",
+          "on": "On",
+          "service": "Service",
+          "deconditioning": "Cooling down",
+          "error": "Error"
+        }
+      },
+      "system_targetstate": {
+        "name": "Target state",
+        "state": {
+          "boot": "Booting",
+          "eco": "Eco",
+          "standby": "Standby",
+          "ready": "Ready",
+          "conditioning": "Warming up",
+          "on": "On",
+          "service": "Service",
+          "deconditioning": "Cooling down",
+          "error": "Error"
+        }
+      },
+      "health": {
+        "name": "Health",
+        "state": {
+          "normal": "Normal",
+          "warning": "Warning",
+          "error": "Error"
+        }
+      }
+    }
+  }
+}

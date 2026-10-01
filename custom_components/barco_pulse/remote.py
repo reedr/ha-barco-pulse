@@ -1,66 +1,53 @@
-"""Remote platform."""
+"""The projector as a remote: power, plus raw JSON-RPC methods via send_command."""
+
+from __future__ import annotations
 
 from collections.abc import Iterable
-import logging
 from typing import Any
 
 from homeassistant.components.remote import RemoteEntity, RemoteEntityDescription
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .coordinator import BarcoConfigEntry, BarcoCoordinator
+from .coordinator import BarcoConfigEntry
 from .entity import BarcoEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-REMOTE_DESC = RemoteEntityDescription(
-    key="projector",
-    translation_key="Projector"
-)
+DESCRIPTION = RemoteEntityDescription(key="projector", name=None)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: BarcoConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: BarcoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Add Remote entity."""
-    coord = config_entry.runtime_data
-
-    async_add_entities([BarcoRemote(coord)])
+    """Add the remote."""
+    async_add_entities([BarcoRemote(entry.runtime_data, DESCRIPTION)])
 
 
-class BarcoRemote(RemoteEntity, BarcoEntity):
-    """Screen as a Remote."""
-
-    def __init__(self, coord: BarcoCoordinator) -> None:
-        """Get going."""
-        super().__init__(coord, REMOTE_DESC)
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if entity is on."""
-        return self.coordinator.device.is_on
+class BarcoRemote(BarcoEntity, RemoteEntity):
+    """Power, and ``send_command`` with method names such as ``system.gotoready``."""
 
     @property
     def available(self) -> bool:
-        """Return online state."""
+        """Always, so the projector can be woken."""
         return True
 
+    @property
+    def is_on(self) -> bool:
+        """Whether the projector is on."""
+        return self.coordinator.device.is_on
+
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the device on."""
-        await self.coordinator.device.turn_on()
+        """Power on; wakes the projector first if needed."""
+        await self._async_run(self.coordinator.device.async_turn_on())
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the device off."""
-        await self.coordinator.device.turn_off()
+        """Power off."""
+        await self._async_run(self.coordinator.device.async_turn_off())
 
     async def async_send_command(self, command: Iterable[str], **kwargs: Any) -> None:
-        """Send command to device."""
-        for c in command:
-            await self.coordinator.device.send_command(c, "[]")
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self.schedule_update_ha_state()
+        """Send each command as a parameterless JSON-RPC method."""
+        for method in command:
+            await self._async_run(self.coordinator.device.async_command(method))

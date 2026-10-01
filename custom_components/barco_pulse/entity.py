@@ -1,55 +1,78 @@
-"""Barco Entity Base class."""
+"""Base entity for Barco Pulse."""
 
-import logging
+from __future__ import annotations
 
-from homeassistant.helpers.device_registry import DeviceInfo
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
+
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo, format_mac
 from homeassistant.helpers.entity import EntityDescription
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
 from .coordinator import BarcoCoordinator
-from .device import DEVICE_MODEL, BarcoDevice
-
-_LOGGER = logging.getLogger(__name__)
+from .device import (
+    SYSTEM_FIRMWARE,
+    SYSTEM_MODEL,
+    SYSTEM_NAME,
+    SYSTEM_SERIAL,
+    BarcoAsleep,
+    BarcoError,
+)
 
 
 class BarcoEntity(CoordinatorEntity[BarcoCoordinator]):
-    """Base class."""
+    """An entity of one projector; unique IDs are ``<mac>_<key>``."""
 
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: BarcoCoordinator, desc: EntityDescription) -> None:
-        """Set up entity."""
-        super().__init__(coordinator, desc)
-
-        self.entity_description = desc
-        self._state = None
-        self._attr_name = desc.key
-        self._attr_unique_id = f"{self.coordinator.device.device_id}_{self.device_id}"
-        _LOGGER.debug("%s", self.unique_id)
+    def __init__(self, coordinator: BarcoCoordinator, description: EntityDescription) -> None:
+        """Set up the entity."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        device = coordinator.device
+        data = coordinator.data or {}
+        self._attr_unique_id = f"{device.mac}_{description.key}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.device.device_id)},
+            identifiers={(DOMAIN, device.mac)},
+            connections={(CONNECTION_NETWORK_MAC, format_mac(device.mac))},
             manufacturer=MANUFACTURER,
-            name=coordinator.device.device_id,
+            model=data.get(SYSTEM_MODEL),
+            serial_number=data.get(SYSTEM_SERIAL),
+            sw_version=data.get(SYSTEM_FIRMWARE),
+            name=data.get(SYSTEM_NAME) or "Barco projector",
+            configuration_url=f"http://{device.host}",
         )
-#        _LOGGER.error(f"new entity={entity} name={self._attr_name} unique_id={self.unique_id}")
+
+    async def _async_run(self, command: Awaitable[None]) -> None:
+        """Run a command, reporting failures to the caller."""
+        try:
+            await command
+        except BarcoAsleep as err:
+            raise HomeAssistantError("The projector is asleep; turn it on first") from err
+        except BarcoError as err:
+            raise HomeAssistantError(f"Barco {self.coordinator.device.host}: {err}") from err
+
+
+@dataclass(frozen=True, kw_only=True)
+class BarcoValueMixin:
+    """How an entity reads its value from the device data."""
+
+    value_fn: Callable[[dict[str, Any]], Any]
+
+
+class BarcoValueEntity(BarcoEntity):
+    """A reading; unavailable until the projector has reported it."""
+
+    entity_description: BarcoValueMixin  # type: ignore[assignment]
 
     @property
-    def entity_type(self) -> str | None:
-        """Type of entity."""
-        return None
+    def _value(self) -> Any:
+        return self.entity_description.value_fn(self.coordinator.data or {})
 
     @property
-    def device_id(self):
-        """Return entity id."""
-        return self.entity_description.key
-
-    @property
-    def device(self) -> BarcoDevice:
-        """Return device."""
-        return self.coordinator.device
-
-    @property
-    def state(self):
-        """Return state."""
-        return self._state
+    def available(self) -> bool:
+        """Available while the projector has a value for this."""
+        return super().available and self._value is not None

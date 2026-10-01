@@ -1,273 +1,304 @@
-"""Stewart Barco Device."""
+"""JSON-RPC client for Barco Pulse projectors (TCP port 9090).
+
+The projector speaks JSON-RPC 2.0 over a raw TCP stream with no framing, sends
+replies out of order, and pushes ``property.changed`` notifications for
+subscribed properties. In eco mode it drops off the network and has to be woken
+with a wake-on-LAN packet.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import codecs
 import json
 import logging
+import re
 import socket
 import time
+from collections.abc import Callable
+from typing import Any
 
 from wakeonlan import send_magic_packet
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
-
-from .const import (
-    MANUFACTURER,
-    BARCO_CONNECT_TIMEOUT,
-    BARCO_KEEPALIVE_INTERVAL,
-    BARCO_KEEPALIVE_TIMEOUT,
-    BARCO_LOGIN_TIMEOUT,
-    BARCO_MAX_BUFFER,
-    BARCO_MAX_PENDING,
-    BARCO_PORT,
-    BARCO_RECONNECT_DELAY,
-    BARCO_RECONNECT_DELAY_MAX,
-    BARCO_WRITE_TIMEOUT,
-)
+from . import const
 
 _LOGGER = logging.getLogger(__name__)
 
-DEVICE_SYSTEM_TARGETSTATE = "system.targetstate"
-DEVICE_SYSTEM_STATE = "system.state"
-DEVICE_INLET_T = "environment.temperature.inlet.value"
-DEVICE_OUTLET_T = "environment.temperature.outlet.value"
-DEVICE_LASER_STATUS = "illumination.sources.laser.status"
-DEVICE_LASER_ON = "laser"
-DEVICE_HDMI_SIGNAL = "image.connector.hdmi.detectedsignal"
-DEVICE_OUTPUT_SIZE = "image.resolution.processing.size"
-DEVICE_INPUT_ACTIVE = "input_active"
-DEVICE_INPUT_SIGNAL = "input_signal"
-DEVICE_OUTPUT_HRES = "output_hres"
-DEVICE_OUTPUT_VRES = "output_vres"
-DEVICE_OUTPUT_RES = "output_res"
-DEVICE_MAINBOARD_T = "environment.temperature.mainboard.value"
-DEVICE_ILLUM_STATE = "illumination.state"
-DEVICE_ILLUM_ON = "illumination"
-DEVICE_MODEL = "system.modelname"
-DEVICE_SERIAL_NUM = "system.serialnumber"
-DEVICE_INPUT_SOURCE = "image.window.main.source"
-DEVICE_INPUT_SOURCE_LIST = "image.source.list"
+SYSTEM_TARGETSTATE = "system.targetstate"
+SYSTEM_STATE = "system.state"
+SYSTEM_HEALTH = "system.health"
+SYSTEM_MODEL = "system.modelname"
+SYSTEM_SERIAL = "system.serialnumber"
+SYSTEM_NAME = "system.name"
+SYSTEM_FIRMWARE = "system.firmwareversion"
+INLET_T = "environment.temperature.inlet.value"
+OUTLET_T = "environment.temperature.outlet.value"
+MAINBOARD_T = "environment.temperature.mainboard.value"
+LASER_STATUS = "illumination.sources.laser.status"
+ILLUM_STATE = "illumination.state"
+HDMI_SIGNAL = "image.connector.hdmi.detectedsignal"
+OUTPUT_SIZE = "image.resolution.processing.size"
+INPUT_SOURCE = "image.window.main.source"
 
-PROPERTY_SUBS = [
-    DEVICE_SYSTEM_TARGETSTATE,
-    DEVICE_SYSTEM_STATE,
-    DEVICE_INLET_T,
-    DEVICE_OUTLET_T,
-    DEVICE_MAINBOARD_T,
-    DEVICE_LASER_STATUS,
-    DEVICE_HDMI_SIGNAL,
-    DEVICE_OUTPUT_SIZE,
-    DEVICE_ILLUM_STATE,
-    DEVICE_INPUT_SOURCE,
+# Derived values (not projector properties).
+SOURCE_LIST = "image.source.list"
+LASER_ON = "laser"
+ILLUM_ON = "illumination"
+INPUT_ACTIVE = "input_active"
+INPUT_SIGNAL = "input_signal"
+OUTPUT_HRES = "output_hres"
+OUTPUT_VRES = "output_vres"
+OUTPUT_RES = "output_res"
+
+IDENTITY = [SYSTEM_MODEL, SYSTEM_SERIAL, SYSTEM_NAME, SYSTEM_FIRMWARE]
+
+SUBSCRIBED = [
+    SYSTEM_TARGETSTATE,
+    SYSTEM_STATE,
+    SYSTEM_HEALTH,
+    INLET_T,
+    OUTLET_T,
+    MAINBOARD_T,
+    LASER_STATUS,
+    HDMI_SIGNAL,
+    OUTPUT_SIZE,
+    ILLUM_STATE,
+    INPUT_SOURCE,
 ]
 
-PROPERTY_INIT = PROPERTY_SUBS
+# system.state values (from the projector's introspection).
+STATES = [
+    "boot",
+    "eco",
+    "standby",
+    "ready",
+    "conditioning",
+    "on",
+    "service",
+    "deconditioning",
+    "error",
+]
+# States in which the projector is off the network or can't be driven yet.
+SLEEP_STATES = ("eco", "boot")
+ON_STATES = ("on", "conditioning")
+HEALTH_STATES = ["Normal", "Warning", "Error"]
 
-# States in which the projector accepts control.
-READY_STATES = ("ready", "on", "conditioning")
+# Kept across a dropped connection; live readings are cleared so sensors go
+# unavailable instead of showing stale values.
+PERSIST_KEYS = (*IDENTITY, SOURCE_LIST)
 
-# Commands that are allowed to run while the projector is asleep: they are
-# the ones whose whole purpose is to wake it up.
-POWER_METHODS = ("system.poweron", "system.gotoready")
+# Parameterless commands are sent with "[]" as params, which the projector
+# has always accepted from this integration.
+NO_PARAMS = "[]"
 
-# Values worth keeping across a dropped connection.  Everything else is
-# cleared so the sensors go unavailable instead of showing stale readings.
-PERSIST_KEYS = (DEVICE_MODEL, DEVICE_SERIAL_NUM, DEVICE_INPUT_SOURCE_LIST)
+_MAC_RE = re.compile(r"[0-9a-f]{12}")
+
+
+class BarcoError(Exception):
+    """Base error."""
+
+
+class BarcoConnectionError(BarcoError, ConnectionError):
+    """The projector could not be reached or dropped the connection."""
+
+
+class BarcoRpcError(BarcoConnectionError):
+    """The projector answered a request with a JSON-RPC error."""
+
+
+class BarcoAsleep(BarcoConnectionError):
+    """The projector is in eco mode (or still booting) and can't be driven."""
+
+
+class BarcoAuthError(BarcoError):
+    """The projector rejected the PIN code."""
+
+
+def normalize_mac(mac: str) -> str:
+    """``00.0d.0a.51.1b.08``, ``00:0D:0A:51:1B:08``, ``000d.0a51.1b08`` -> ``000d0a511b08``."""
+    text = (mac or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F.:\- ]+", text):
+        raise ValueError(f"Not a MAC address: {mac!r}")
+    flat = re.sub(r"[^0-9a-fA-F]", "", text).lower()
+    if not _MAC_RE.fullmatch(flat):
+        raise ValueError(f"Not a MAC address: {mac!r}")
+    return flat
+
+
+def _c(value: Any) -> float | None:
+    return round(float(value), 1) if isinstance(value, (int, float)) else None
 
 
 class BarcoDevice:
-    """Represents a single Barco device."""
+    """One projector over a single long-lived JSON-RPC session."""
 
-    def __init__(self, hass: HomeAssistant, host: str, mac: str, pin_code: str) -> None:
-        """Set up class."""
-
-        _LOGGER.info("Initialize Barco Pulse device (host=%s, mac=%s)", host, mac)
-        self._hass = hass
-        self._host = host
-        mac = mac.lower()
-        self._mac = mac
-        if len(mac) == 17:
-            sep = mac[2]
-            self._mac8 = mac.replace(sep, '')
-        elif len(mac) == 14:
-            sep = mac[4]
-            self._mac8 = mac.replace(sep, '')
-        else:
-            raise ValueError('Incorrect MAC address format')
-        self._device_id = f"{MANUFACTURER}:{self._mac8}"
+    def __init__(self, host: str, mac: str, pin_code: str | None) -> None:
+        """Set up the client; nothing connects until :meth:`check_connection`."""
+        self.host = host
+        self.mac = normalize_mac(mac)
         self._pin_code = pin_code
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._online = False
         self._authenticated = False
         self._poweron_pending = False
-        self._callback = None
-        self._listener = None
-        self._keepalive = None
-        self._reconnector = None
+        self._callback: Callable[[dict[str, Any]], None] | None = None
+        self._listener: asyncio.Task | None = None
+        self._keepalive: asyncio.Task | None = None
+        self._reconnector: asyncio.Task | None = None
         self._closing = False
         self._conn_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._request_id = 1
-        self._requests = {}
-        self._data = {}
+        self._requests: dict[int, dict] = {}
+        self._data: dict[str, Any] = {}
         self._sleeping = False
-        self._connection_tested = False
+        self._wake_until = 0.0
         self._last_rx = 0.0
         self._buffer = ""
         self._stream_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._json_decoder = json.JSONDecoder()
 
-    @property
-    def device_id(self) -> str:
-        """Unique device identifier."""
-        return self._device_id
+    # ─── state ──
 
     @property
     def online(self) -> bool:
-        """Return status."""
+        """Whether a session is up."""
         return self._online
 
     @property
     def sleeping(self) -> bool:
-        """Return True when the projector is known to be asleep."""
+        """Whether the projector is known to be in eco mode."""
         return self._sleeping
 
     @property
-    def connection_tested(self) -> bool:
-        """Return connection success."""
-        return self._connection_tested
+    def authenticated(self) -> bool:
+        """Whether the PIN was accepted on this session."""
+        return self._authenticated
 
     @property
-    def data(self) -> dict:
-        """Return data."""
-        return self._data
+    def data(self) -> dict[str, Any]:
+        """A copy of the latest values."""
+        return dict(self._data)
 
     @property
-    def sensors(self) -> list[str]:
-        """Return the sensor names."""
-        return PROPERTY_SUBS
-
-    def get_sensor_value(self, name: str):
-        """Return the sensor."""
-        return self._data.get(name)
-
-    def _wake_on_lan(self) -> None:
-        """Wake the device via wake on lan."""
-        send_magic_packet(self._mac)
-
-    async def wakeup(self) -> None:
-        """Wake up the device."""
-        _LOGGER.info("Attempting to wake projector at %s", self._mac)
-        await self._hass.async_add_executor_job(self._wake_on_lan)
-
-    # ------------------------------------------------------------------
-    # Connection handling
-    # ------------------------------------------------------------------
-
-    def _is_connected(self) -> bool:
-        """Do we have a usable socket?"""
+    def is_on(self) -> bool:
+        """Whether the projector is on (or warming up to it)."""
         return (
-            self._online
-            and self._writer is not None
-            and not self._writer.is_closing()
+            self._data.get(SYSTEM_TARGETSTATE) in ON_STATES
+            or self._data.get(SYSTEM_STATE) in ON_STATES
         )
 
-    async def check_connection(self, test: bool = False) -> None:
-        """Establish a connection, unless a usable one is already up."""
+    def set_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Receive every change (a copy of the data)."""
+        self._callback = callback
+
+    def _notify(self) -> None:
+        if self._callback is not None:
+            try:
+                self._callback(self.data)
+            except Exception:
+                _LOGGER.exception("Error in update callback")
+
+    # ─── connection ──
+
+    def _is_connected(self) -> bool:
+        return self._online and self._writer is not None and not self._writer.is_closing()
+
+    async def check_connection(self) -> None:
+        """Connect and set up the session unless one is already up."""
         if self._is_connected():
             return
-
         async with self._conn_lock:
-            # Another task may have connected while we waited for the lock.
             if self._is_connected():
                 return
             if self._online:
-                _LOGGER.debug("Closing stale connection in check_connection")
                 self._connection_lost(reconnect=False)
-            await self._connect(test)
+            await self._connect()
 
-    async def _connect(self, test: bool = False) -> None:
-        """Open a socket and run the handshake.  Caller holds _conn_lock."""
-        writer = None
-        try:
-            _LOGGER.debug("Attempting to establish new connection")
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self._host, BARCO_PORT),
-                timeout=BARCO_CONNECT_TIMEOUT,
-            )
-            self._set_socket_options(writer)
-            self._reader = reader
-            self._writer = writer
-            self._buffer = ""
-            self._stream_decoder.reset()
-            self._requests.clear()
-            self._request_id = 1
-            self._authenticated = False
-            self._last_rx = time.monotonic()
-
-            # 1. Identify the projector and check that it can be driven.
-            result = await self._request(
-                "property.get",
-                {"property": [DEVICE_MODEL, DEVICE_SERIAL_NUM, DEVICE_SYSTEM_STATE]},
-            )
-            state = (result or {}).get(DEVICE_SYSTEM_STATE)
-            if state not in READY_STATES:
-                self._sleeping = True
-                _LOGGER.debug("Projector not ready (state=%s)", state)
-                raise ConnectionError(f"Device not initialized (state={state})")
-            for prop, val in result.items():
-                self._data[prop] = val
-
-            if test:
-                self._connection_tested = True
+    async def async_test_connection(self) -> dict[str, Any]:
+        """Connect, check the PIN, read the identity and disconnect (config flow)."""
+        async with self._conn_lock:
+            try:
+                await self._open()
+                result = await self._handshake()
+            finally:
                 await self._disconnect()
-                return
+        return result
 
-            # 2. Authenticate.  A failure here is not fatal: reads keep
-            #    working, but writes will be refused, so make it loud.
-            if self._pin_code not in (None, ""):
-                try:
-                    await self._request(
-                        "authenticate", {"code": int(self._pin_code)}
-                    )
-                    self._authenticated = True
-                except ValueError:
-                    _LOGGER.error("PIN code %r is not numeric", self._pin_code)
-                except (ConnectionError, TimeoutError) as err:
-                    _LOGGER.error(
-                        "Authentication was refused (%s). Commands that change "
-                        "the projector will fail until the PIN is corrected",
-                        err,
-                    )
+    async def _open(self) -> None:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, const.BARCO_PORT),
+                timeout=const.BARCO_CONNECT_TIMEOUT,
+            )
+        except (OSError, TimeoutError) as err:
+            raise BarcoConnectionError(f"Cannot connect to {self.host}: {err!r}") from err
+        self._set_socket_options(writer)
+        self._reader, self._writer = reader, writer
+        self._buffer = ""
+        self._stream_decoder.reset()
+        self._requests.clear()
+        self._request_id = 1
+        self._authenticated = False
+        self._last_rx = time.monotonic()
 
-            # 3. Subscribe, then start listening for unsolicited updates.
-            await self._request("property.subscribe", {"property": PROPERTY_SUBS})
+    async def _handshake(self) -> dict[str, Any]:
+        """Read identity and state, then authenticate. Raises BarcoAsleep/BarcoAuthError."""
+        result = await self._request("property.get", {"property": [*IDENTITY, SYSTEM_STATE]})
+        result = result if isinstance(result, dict) else {}
+        state = result.get(SYSTEM_STATE)
+        if state in SLEEP_STATES or state is None:
+            self._sleeping = True
+            raise BarcoAsleep(f"{self.host} is not ready (state={state})")
+        self._sleeping = False
+        for prop in IDENTITY:
+            if prop in result:
+                self._data[prop] = result[prop]
+        self._data[SYSTEM_STATE] = state
 
+        if self._pin_code not in (None, ""):
+            try:
+                code = int(self._pin_code)
+            except ValueError as err:
+                raise BarcoAuthError("The PIN code must be numeric") from err
+            try:
+                await self._request("authenticate", {"code": code})
+            except BarcoRpcError as err:
+                raise BarcoAuthError(f"{self.host} rejected the PIN code") from err
+            self._authenticated = True
+        return result
+
+    async def _connect(self) -> None:
+        """Open and set up a session. Caller holds _conn_lock."""
+        try:
+            await self._open()
+            try:
+                await self._handshake()
+            except BarcoAuthError as err:
+                # Reads keep working without the PIN; only control is refused.
+                _LOGGER.error(
+                    "%s: %s. Commands will be refused until the PIN is corrected",
+                    self.host,
+                    err,
+                )
+            await self._request("property.subscribe", {"property": SUBSCRIBED})
             self._online = True
-            self._sleeping = False
-            self._listener = asyncio.create_task(self.listener())
+            self._listener = asyncio.create_task(self._listen())
             self._keepalive = asyncio.create_task(self._keepalive_loop())
-
-            # 4. Prime the cache.  Responses arrive via the listener.
-            await self.send_request("property.get", {"property": PROPERTY_INIT})
-            await self.send_request("image.source.list", "[]")
+            # Replies arrive through the listener.
+            await self.send_request("property.get", {"property": SUBSCRIBED})
+            await self.send_request("image.source.list", NO_PARAMS)
             if self._poweron_pending:
-                await self.send_request("system.poweron", "[]")
                 self._poweron_pending = False
-
-        except Exception as err:
-            _LOGGER.debug("Connection failed: %s", err)
-            # Never leave a half-open socket or a half-initialized session
-            # behind, whatever went wrong.
+                _LOGGER.info("%s is awake; powering on", self.host)
+                await self.send_request("system.poweron", NO_PARAMS)
+        except BaseException:
             if self._online:
                 self._connection_lost(reconnect=False)
-            elif writer is not None:
-                self._reader = None
-                self._writer = None
-                await self._close_writer(writer)
-            raise err
+            else:
+                await self._disconnect()
+            raise
 
     @staticmethod
     def _set_socket_options(writer: asyncio.StreamWriter) -> None:
@@ -290,101 +321,83 @@ class BarcoDevice:
         except OSError as err:
             _LOGGER.debug("Could not set socket options: %s", err)
 
-    @staticmethod
-    async def _close_writer(writer: asyncio.StreamWriter) -> None:
-        """Close a writer and wait for the transport to go away."""
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except OSError as err:
-            _LOGGER.debug("Error while closing connection: %s", err)
-
     async def _disconnect(self) -> None:
-        """Close the current connection without scheduling a reconnect."""
-        writer, self._writer = self._writer, None
-        self._reader = None
+        """Close the socket without scheduling a reconnect."""
+        writer, self._writer, self._reader = self._writer, None, None
         self._online = False
         if writer is not None:
-            await self._close_writer(writer)
+            writer.close()
+            try:
+                async with asyncio.timeout(2):
+                    await writer.wait_closed()
+            except (OSError, TimeoutError):
+                pass
 
     def _connection_lost(self, reconnect: bool = True) -> None:
-        """Tear down a dead connection and schedule a reconnect.
-
-        Must stay synchronous: it runs from the listener's finally block,
-        which may be executing because the task was cancelled.
-        """
+        """Tear down a dead session; synchronous, as it runs from the listener's finally."""
         was_online = self._online
         self._online = False
         self._authenticated = False
-        writer, self._writer = self._writer, None
-        self._reader = None
+        writer, self._writer, self._reader = self._writer, None, None
         self._requests.clear()
         self._buffer = ""
         if writer is not None:
-            try:
-                writer.close()
-            except OSError as err:
-                _LOGGER.debug("Error while closing connection: %s", err)
-
+            writer.close()
         current = asyncio.current_task()
         if self._keepalive is not None and self._keepalive is not current:
             self._keepalive.cancel()
         self._keepalive = None
 
-        # Keep the identity and the source list, drop the live readings so
-        # the sensors go unavailable rather than showing stale values.
         keep = {k: v for k, v in self._data.items() if k in PERSIST_KEYS}
-        self._data.clear()
-        self._data.update(keep)
-        if was_online and self._callback is not None:
-            self._callback(self._data)
+        self._data = keep
+        if was_online:
+            self._notify()
+        if reconnect:
+            self._start_reconnect()
 
-        if not reconnect or self._closing or self._sleeping:
+    def _start_reconnect(self) -> None:
+        if self._closing or (self._sleeping and time.monotonic() >= self._wake_until):
             return
         if self._reconnector is None or self._reconnector.done():
             self._reconnector = asyncio.create_task(self._reconnect())
 
     async def _reconnect(self) -> None:
-        """Reconnect in the background, backing off between attempts."""
-        delay = BARCO_RECONNECT_DELAY
-        while not self._closing and not self._online and not self._sleeping:
-            _LOGGER.debug("Reconnecting to %s in %ss", self._host, delay)
-            await asyncio.sleep(delay)
-            if self._closing or self._online or self._sleeping:
+        """Reconnect in the background; after a wake-up, keep trying through the boot."""
+        delay = const.BARCO_RECONNECT_DELAY
+        while not self._closing and not self._online:
+            waking = time.monotonic() < self._wake_until
+            if self._sleeping and not waking:
                 return
+            await asyncio.sleep(const.BARCO_RECONNECT_DELAY if waking else delay)
             try:
                 await self.check_connection()
-                _LOGGER.info("Reconnected to %s", self._host)
+            except (BarcoConnectionError, TimeoutError, OSError) as err:
+                _LOGGER.debug("Reconnect to %s failed: %s", self.host, err)
+            else:
+                _LOGGER.info("Connected to %s", self.host)
                 return
-            except (ConnectionError, TimeoutError, OSError) as err:
-                _LOGGER.debug("Reconnect to %s failed: %s", self._host, err)
-            delay = min(delay * 2, BARCO_RECONNECT_DELAY_MAX)
+            delay = min(delay * 2, const.BARCO_RECONNECT_DELAY_MAX)
+        if not self._online:
+            self._poweron_pending = False
 
     async def _keepalive_loop(self) -> None:
-        """Probe the link so a silently dead socket does not go unnoticed."""
+        """Probe the link so a silently dead socket doesn't go unnoticed."""
         while True:
-            await asyncio.sleep(BARCO_KEEPALIVE_INTERVAL)
+            await asyncio.sleep(const.BARCO_KEEPALIVE_INTERVAL)
             if not self._online:
                 return
-            if time.monotonic() - self._last_rx < BARCO_KEEPALIVE_INTERVAL:
-                # The projector is talking to us, no probe needed.
+            if time.monotonic() - self._last_rx < const.BARCO_KEEPALIVE_INTERVAL:
                 continue
             mark = self._last_rx
             try:
-                await self.send_request(
-                    "property.get", {"property": [DEVICE_SYSTEM_STATE]}
-                )
-            except (ConnectionError, TimeoutError, OSError) as err:
-                _LOGGER.warning("Keepalive to %s failed: %s", self._host, err)
+                await self.send_request("property.get", {"property": [SYSTEM_STATE]})
+            except BarcoConnectionError as err:
+                _LOGGER.warning("Keepalive to %s failed: %s", self.host, err)
                 self._force_disconnect()
                 return
-            await asyncio.sleep(BARCO_KEEPALIVE_TIMEOUT)
+            await asyncio.sleep(const.BARCO_KEEPALIVE_TIMEOUT)
             if self._online and self._last_rx == mark:
-                _LOGGER.warning(
-                    "No reply from %s within %ss, dropping connection",
-                    self._host,
-                    BARCO_KEEPALIVE_TIMEOUT,
-                )
+                _LOGGER.warning("No reply from %s; dropping the connection", self.host)
                 self._force_disconnect()
                 return
 
@@ -394,17 +407,14 @@ class BarcoDevice:
         if writer is None:
             self._connection_lost()
             return
-        try:
-            transport = writer.transport
-            if transport is not None:
-                transport.abort()
-            else:
-                writer.close()
-        except OSError as err:
-            _LOGGER.debug("Error while aborting connection: %s", err)
+        transport = writer.transport
+        if transport is not None:
+            transport.abort()
+        else:
+            writer.close()
 
     async def async_close(self) -> None:
-        """Shut down for good (config entry unload)."""
+        """Shut down for good (entry unload)."""
         self._closing = True
         for task in (self._reconnector, self._keepalive, self._listener):
             if task is not None:
@@ -412,60 +422,47 @@ class BarcoDevice:
         self._reconnector = self._keepalive = self._listener = None
         await self._disconnect()
 
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
+    # ─── sending ──
 
-    async def send_request(self, method: str, params) -> int:
-        """Format and send a request.  Returns its id."""
+    async def send_request(self, method: str, params: Any) -> int:
+        """Send a request; its reply is handled by the listener. Returns its id."""
         req_id = self._request_id
         self._request_id += 1
         req = {"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}
         self._requests[req_id] = req
-        self._prune_requests()
-        await self._write(req)
-        return req_id
-
-    async def _write(self, req: dict) -> None:
-        """Put one request on the wire."""
+        while len(self._requests) > const.BARCO_MAX_PENDING:
+            del self._requests[next(iter(self._requests))]
         writer = self._writer
         if writer is None or writer.is_closing():
-            raise ConnectionError("No connection to device")
-        reqstr = json.dumps(req)
+            raise BarcoConnectionError("Not connected")
+        text = json.dumps(req)
         async with self._write_lock:
-            _LOGGER.debug("-> %s", reqstr)
+            _LOGGER.debug("%s -> %s", self.host, text)
             try:
-                writer.write(reqstr.encode("ascii"))
-                await asyncio.wait_for(writer.drain(), timeout=BARCO_WRITE_TIMEOUT)
+                writer.write(text.encode())
+                await asyncio.wait_for(writer.drain(), timeout=const.BARCO_WRITE_TIMEOUT)
             except (TimeoutError, OSError) as err:
-                _LOGGER.warning("Write to %s failed: %s", self._host, err)
                 self._force_disconnect()
-                raise ConnectionError("Write failed") from err
+                raise BarcoConnectionError(f"Write to {self.host} failed: {err!r}") from err
+        return req_id
 
-    def _prune_requests(self) -> None:
-        """Keep the pending map from growing without bound."""
-        while len(self._requests) > BARCO_MAX_PENDING:
-            req_id, req = next(iter(self._requests.items()))
-            _LOGGER.debug("Discarding unanswered request %s (%s)", req_id, req["method"])
-            del self._requests[req_id]
-
-    async def _request(self, method: str, params, timeout: float | None = None):
-        """Send a request and wait for its response.
-
-        Only used during the handshake, before the listener owns the reader.
-        Anything else arriving meanwhile is dispatched normally.
-        """
-        if timeout is None:
-            timeout = BARCO_LOGIN_TIMEOUT
+    async def _request(self, method: str, params: Any) -> Any:
+        """Send and wait for the reply; only used before the listener starts."""
         req_id = await self.send_request(method, params)
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + const.BARCO_LOGIN_TIMEOUT
+        assert self._reader is not None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"No response to {method}")
-            chunk = await asyncio.wait_for(self._reader.read(4096), timeout=remaining)
+                raise BarcoConnectionError(f"No reply to {method} from {self.host}")
+            try:
+                chunk = await asyncio.wait_for(self._reader.read(65536), timeout=remaining)
+            except TimeoutError:
+                continue
+            except OSError as err:
+                raise BarcoConnectionError(f"{self.host}: {err!r}") from err
             if not chunk:
-                raise ConnectionError("Connection closed by device")
+                raise BarcoConnectionError(f"{self.host} closed the connection")
             self._last_rx = time.monotonic()
             for msg in self._extract_messages(chunk):
                 if msg.get("id") != req_id:
@@ -473,209 +470,165 @@ class BarcoDevice:
                     continue
                 self._requests.pop(req_id, None)
                 if "error" in msg:
-                    raise ConnectionError(f"{method} failed: {msg['error']}")
+                    raise BarcoRpcError(f"{method} failed: {msg['error']}")
                 return msg.get("result")
 
-    # ------------------------------------------------------------------
-    # Receiving
-    # ------------------------------------------------------------------
+    # ─── receiving ──
 
     def _extract_messages(self, chunk: bytes) -> list[dict]:
-        """Turn a stream of bytes into whole JSON messages.
-
-        The projector does not delimit its messages and a read can end in
-        the middle of one, so anything incomplete stays in the buffer until
-        the rest of it arrives.
-        """
+        """Split the unframed stream into JSON messages, keeping any partial tail."""
         self._buffer += self._stream_decoder.decode(chunk)
         messages = []
         while self._buffer:
             buf = self._buffer.lstrip()
             if not buf.startswith("{"):
-                # Resynchronize on the start of the next message.
                 start = buf.find("{")
                 if start < 0:
                     self._buffer = ""
                     break
-                _LOGGER.debug("Skipping %d bytes of stream noise", start)
                 buf = buf[start:]
             try:
                 msg, end = self._json_decoder.raw_decode(buf)
             except json.JSONDecodeError:
-                # Incomplete: keep it and wait for the rest.
                 self._buffer = buf
-                if len(self._buffer) > BARCO_MAX_BUFFER:
-                    _LOGGER.error("Discarding %d bytes of undecodable input",
-                                  len(self._buffer))
+                if len(self._buffer) > const.BARCO_MAX_BUFFER:
+                    _LOGGER.error("Discarding %d bytes of undecodable input", len(buf))
                     self._buffer = ""
                 break
-            _LOGGER.debug("<- %s", buf[:end])
             self._buffer = buf[end:]
             if isinstance(msg, dict) and msg.get("jsonrpc") == "2.0":
                 messages.append(msg)
             else:
-                _LOGGER.warning("Ignoring unexpected message: %s", msg)
+                _LOGGER.debug("Ignoring unexpected message: %s", msg)
         return messages
 
-    async def listener(self) -> None:
-        """Listen for status updates from device."""
+    async def _listen(self) -> None:
+        """Handle replies and notifications until the connection ends."""
         try:
             while True:
-                chunk = await self._reader.read(4096)
+                assert self._reader is not None
+                chunk = await self._reader.read(65536)
                 if not chunk:
-                    _LOGGER.warning("Connection to %s closed by device", self._host)
+                    _LOGGER.info("%s closed the connection", self.host)
                     break
                 self._last_rx = time.monotonic()
                 for msg in self._extract_messages(chunk):
                     self._dispatch(msg)
                 if self._sleeping:
-                    _LOGGER.info("Projector is asleep, closing connection")
+                    _LOGGER.info("%s is going to sleep; disconnecting", self.host)
                     break
         except asyncio.CancelledError:
             raise
         except OSError as err:
-            _LOGGER.warning("Connection to %s lost: %s", self._host, err)
-        except Exception:  # noqa: BLE001 - never let the listener die quietly
-            _LOGGER.exception("Unexpected error reading from %s", self._host)
+            _LOGGER.warning("Connection to %s lost: %s", self.host, err)
+        except Exception:
+            _LOGGER.exception("Unexpected error reading from %s", self.host)
         finally:
             self._connection_lost()
 
-    def _dispatch(self, resp: dict) -> None:
-        """Act on one decoded message."""
-        req_id = resp.get("id")
+    def _dispatch(self, msg: dict) -> None:
+        req_id = msg.get("id")
         if req_id is not None:
             req = self._requests.pop(req_id, None)
             if req is None:
-                _LOGGER.debug("Response to unknown request %s: %s", req_id, resp)
                 return
-            _LOGGER.debug("req_id=%s req=%s", req_id, req)
-            if "error" in resp:
-                _LOGGER.warning(
-                    "Projector rejected %s: %s", req["method"], resp["error"]
-                )
+            if "error" in msg:
+                _LOGGER.warning("%s rejected %s: %s", self.host, req["method"], msg["error"])
                 return
             if req["method"] == "property.get":
-                self.property_update(resp.get("result"))
+                self._update(msg.get("result"))
             elif req["method"] == "image.source.list":
-                self._data[DEVICE_INPUT_SOURCE_LIST] = resp.get("result")
-                if self._callback is not None:
-                    self._callback(self._data)
+                result = msg.get("result")
+                if isinstance(result, list):
+                    self._data[SOURCE_LIST] = result
+                    self._notify()
             return
+        if "error" in msg:
+            _LOGGER.warning("Error from %s: %s", self.host, msg["error"])
+        elif msg.get("method") == "property.changed":
+            changes: dict[str, Any] = {}
+            for item in (msg.get("params") or {}).get("property") or []:
+                if isinstance(item, dict):
+                    changes.update(item)
+            self._update(changes)
 
-        if "error" in resp:
-            _LOGGER.warning("Error from projector: %s", resp["error"])
-        elif resp.get("method") == "property.changed":
-            self.property_update(resp["params"]["property"][0])
+    def _update(self, values: Any) -> None:
+        """Apply property values; one malformed value doesn't cost the rest."""
+        if not isinstance(values, dict):
+            return
+        for name, value in values.items():
+            try:
+                self._apply(name, value)
+            except Exception as err:  # noqa: BLE001 - one bad value only
+                _LOGGER.warning("Bad value %s=%r from %s: %s", name, value, self.host, err)
+        self._notify()
 
-    # ------------------------------------------------------------------
-    # Commands
-    # ------------------------------------------------------------------
+    def _apply(self, name: str, value: Any) -> None:
+        if name == HDMI_SIGNAL:
+            self._data[INPUT_ACTIVE] = bool(value.get("active"))
+            self._data[INPUT_SIGNAL] = value.get("name") or None
+        elif name == OUTPUT_SIZE:
+            self._data[OUTPUT_HRES] = value["pixels"]
+            self._data[OUTPUT_VRES] = value["lines"]
+            self._data[OUTPUT_RES] = f"{value['pixels']}x{value['lines']}"
+        elif name in (INLET_T, OUTLET_T, MAINBOARD_T):
+            self._data[name] = _c(value)
+        elif name == ILLUM_STATE:
+            self._data[ILLUM_STATE] = value
+            self._data[ILLUM_ON] = value == "On"
+        elif name == LASER_STATUS:
+            self._data[LASER_STATUS] = value
+            self._data[LASER_ON] = value == "On"
+        else:
+            if name in (SYSTEM_STATE, SYSTEM_TARGETSTATE) and value != self._data.get(name):
+                _LOGGER.info("%s %s: %s", self.host, name, value)
+                if value == "eco":
+                    self._sleeping = True
+            self._data[name] = value
 
-    async def test_connection(self) -> None:
-        """Test a connect."""
-        await self.check_connection(test=True)
+    # ─── commands ──
 
-    async def send_command(self, method: str, params) -> None:
-        """Make an API call."""
-        if method in POWER_METHODS and not self._online:
-            _LOGGER.warning("Projector is not online, waking up")
-            await self.wakeup()
-            if method == "system.poweron":
+    async def _wake(self) -> None:
+        _LOGGER.info("Waking %s (%s) with wake-on-LAN", self.host, self.mac)
+        await asyncio.to_thread(send_magic_packet, self.mac)
+        self._wake_until = time.monotonic() + const.BARCO_WAKE_WINDOW
+        self._start_reconnect()
+
+    async def async_turn_on(self) -> None:
+        """Power on, waking the projector first if it's asleep or unreachable."""
+        if not self._online:
+            try:
+                await self.check_connection()
+            except BarcoConnectionError:
                 self._poweron_pending = True
+                await self._wake()
+                return
+        await self.send_request("system.poweron", NO_PARAMS)
+
+    async def async_turn_off(self) -> None:
+        """Power off (the projector goes to ready or eco, per its settings)."""
+        await self.async_command("system.poweroff", NO_PARAMS)
+
+    async def async_select_source(self, source: str) -> None:
+        """Switch the main window's input."""
+        await self.async_command("property.set", {"property": INPUT_SOURCE, "value": source})
+
+    async def async_command(self, method: str, params: Any = NO_PARAMS) -> None:
+        """Send any JSON-RPC method; raises BarcoAsleep if the projector is asleep."""
+        if method == "system.poweron":
+            await self.async_turn_on()
             return
-
-        if self._sleeping and method not in POWER_METHODS:
-            raise HomeAssistantError(
-                "Projector is asleep; turn it on before sending "
-                f"{method}"
-            )
-
-        await self.check_connection()
+        try:
+            await self.check_connection()
+        except BarcoAsleep:
+            raise
+        except BarcoConnectionError as err:
+            if self._sleeping:
+                raise BarcoAsleep(f"{self.host} is asleep") from err
+            raise
         await self.send_request(method, params)
 
-    async def update_data(self) -> None:
-        """Stuff that has to be polled."""
-        _LOGGER.debug("Updating data")
-        # This doubles as the wake-up probe, so unlike a user command it
-        # does not take the "asleep" shortcut: a successful connect is how
-        # we find out the projector is back.
+    async def async_poll(self) -> None:
+        """Periodic check: reconnect if needed (also how a wake-up is noticed)."""
         await self.check_connection()
-        await self.send_request(
-            "property.get",
-            {"property": [DEVICE_SYSTEM_TARGETSTATE, DEVICE_SYSTEM_STATE]},
-        )
-
-    @property
-    def is_on(self) -> bool:
-        """Is Projector on."""
-        return self._data.get(DEVICE_SYSTEM_TARGETSTATE) in ["on", "conditioning"]
-
-    @property
-    def source_list(self) -> list[str]:
-        """Return source list."""
-        return self._data.get(DEVICE_INPUT_SOURCE_LIST)
-
-    @property
-    def source(self) -> str:
-        """Current source."""
-        return self._data.get(DEVICE_INPUT_SOURCE)
-
-    async def turn_on(self) -> None:
-        """Turn on the power."""
-        await self.send_command("system.poweron", "[]")
-
-    async def turn_off(self) -> None:
-        """Turn on the power."""
-        await self.send_command("system.poweroff", "[]")
-
-    async def select_source(self, source: str) -> None:
-        """Set the input."""
-        await self.send_command(
-            "property.set", {"property": DEVICE_INPUT_SOURCE, "value": source}
-        )
-
-    async def async_init(self, data_callback: callback) -> None:
-        """Initialize the device."""
-        self._callback = data_callback
-
-    def property_update(self, updates) -> None:
-        """Update properties."""
-        if updates is None:
-            return
-        for n, v in updates.items():
-            # One malformed value must not cost us the rest of the batch.
-            try:
-                _LOGGER.debug("Projector update: %s=%s", n, v)
-                if n == DEVICE_HDMI_SIGNAL:
-                    self._data[DEVICE_INPUT_ACTIVE] = v["active"]
-                    self._data[DEVICE_INPUT_SIGNAL] = v["name"]
-                elif n == DEVICE_OUTPUT_SIZE:
-                    pixels = self._data[DEVICE_OUTPUT_HRES] = v["pixels"]
-                    lines = self._data[DEVICE_OUTPUT_VRES] = v["lines"]
-                    self._data[DEVICE_OUTPUT_RES] = f"{pixels}x{lines}"
-                elif n in (DEVICE_INLET_T, DEVICE_OUTLET_T, DEVICE_MAINBOARD_T):
-                    self._data[n] = (v / 5 * 9) + 32
-                elif n == DEVICE_ILLUM_STATE:
-                    self._data[DEVICE_ILLUM_ON] = (v == "On")
-                elif n == DEVICE_LASER_STATUS:
-                    self._data[DEVICE_LASER_ON] = (v == "On")
-                    self._data[DEVICE_LASER_STATUS] = v
-                else:
-                    if v != self._data.get(n):
-                        if n == DEVICE_SYSTEM_STATE:
-                            _LOGGER.info("Projector state: %s", v)
-                        elif n == DEVICE_SYSTEM_TARGETSTATE:
-                            _LOGGER.info("Projector target state: %s", v)
-                        if n in (DEVICE_SYSTEM_STATE, DEVICE_SYSTEM_TARGETSTATE) and v == "eco":
-                            _LOGGER.info("Projector going to sleep")
-                            self._sleeping = True
-                        self._data[n] = v
-
-            except Exception as exc:  # noqa: BLE001 - one bad property only
-                _LOGGER.error("Exception updating %s=%s: %s", n, v, exc)
-
-        if self._callback is not None:
-            try:
-                self._callback(self._data)
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Exception in update callback")
+        await self.send_request("property.get", {"property": [SYSTEM_TARGETSTATE, SYSTEM_STATE]})
