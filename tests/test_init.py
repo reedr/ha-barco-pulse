@@ -146,3 +146,23 @@ async def test_unload(hass: HomeAssistant, barco) -> None:
     assert await hass.config_entries.async_unload(entry.entry_id)
     await _settle(hass)
     assert not device.online and barco._clients == []
+
+
+async def test_go_to_ready_wakes(hass: HomeAssistant, barco, wol) -> None:
+    """The theater's standby script sends system.gotoready to a sleeping projector."""
+    await _setup(hass)
+    await barco.sleep()
+    await _settle(hass)
+    await hass.services.async_call(
+        "remote",
+        "send_command",
+        {"entity_id": "remote.balder_cs_2590392444", "command": ["system.gotoready"]},
+        blocking=True,
+    )
+    assert wol == ["000d0a511b08"]
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if "system.gotoready" in barco.methods():
+            break
+    assert barco.methods().count("system.gotoready") == 1
+    assert hass.states.get("sensor.balder_cs_2590392444_state").state == "ready"

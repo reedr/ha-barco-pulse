@@ -87,6 +87,9 @@ HEALTH_STATES = ["Normal", "Warning", "Error"]
 # unavailable instead of showing stale values.
 PERSIST_KEYS = (*IDENTITY, SOURCE_LIST)
 
+# Methods that wake an asleep projector (wake-on-LAN) and are sent once it's up.
+WAKE_METHODS = ("system.poweron", "system.gotoready")
+
 # Parameterless commands are sent with "[]" as params, which the projector
 # has always accepted from this integration.
 NO_PARAMS = "[]"
@@ -141,7 +144,8 @@ class BarcoDevice:
         self._writer: asyncio.StreamWriter | None = None
         self._online = False
         self._authenticated = False
-        self._poweron_pending = False
+        # A wake method (WAKE_METHODS) to send once a woken projector is reachable.
+        self._pending: str | None = None
         self._callback: Callable[[dict[str, Any]], None] | None = None
         self._listener: asyncio.Task | None = None
         self._keepalive: asyncio.Task | None = None
@@ -289,10 +293,10 @@ class BarcoDevice:
             # Replies arrive through the listener.
             await self.send_request("property.get", {"property": SUBSCRIBED})
             await self.send_request("image.source.list", NO_PARAMS)
-            if self._poweron_pending:
-                self._poweron_pending = False
-                _LOGGER.info("%s is awake; powering on", self.host)
-                await self.send_request("system.poweron", NO_PARAMS)
+            if self._pending is not None:
+                method, self._pending = self._pending, None
+                _LOGGER.info("%s is awake; sending %s", self.host, method)
+                await self.send_request(method, NO_PARAMS)
         except BaseException:
             if self._online:
                 self._connection_lost(reconnect=False)
@@ -378,7 +382,7 @@ class BarcoDevice:
                 return
             delay = min(delay * 2, const.BARCO_RECONNECT_DELAY_MAX)
         if not self._online:
-            self._poweron_pending = False
+            self._pending = None
 
     async def _keepalive_loop(self) -> None:
         """Probe the link so a silently dead socket doesn't go unnoticed."""
@@ -594,16 +598,23 @@ class BarcoDevice:
         self._wake_until = time.monotonic() + const.BARCO_WAKE_WINDOW
         self._start_reconnect()
 
-    async def async_turn_on(self) -> None:
-        """Power on, waking the projector first if it's asleep or unreachable."""
+    async def _wake_command(self, method: str) -> None:
+        """Send a wake method, waking the projector first if it's asleep or unreachable.
+
+        The method is sent once the woken projector accepts a connection.
+        """
         if not self._online:
             try:
                 await self.check_connection()
             except BarcoConnectionError:
-                self._poweron_pending = True
+                self._pending = method
                 await self._wake()
                 return
-        await self.send_request("system.poweron", NO_PARAMS)
+        await self.send_request(method, NO_PARAMS)
+
+    async def async_turn_on(self) -> None:
+        """Power on, waking the projector first if needed."""
+        await self._wake_command("system.poweron")
 
     async def async_turn_off(self) -> None:
         """Power off (the projector goes to ready or eco, per its settings)."""
@@ -614,9 +625,13 @@ class BarcoDevice:
         await self.async_command("property.set", {"property": INPUT_SOURCE, "value": source})
 
     async def async_command(self, method: str, params: Any = NO_PARAMS) -> None:
-        """Send any JSON-RPC method; raises BarcoAsleep if the projector is asleep."""
-        if method == "system.poweron":
-            await self.async_turn_on()
+        """Send any JSON-RPC method.
+
+        Wake methods (power on, go to ready) wake an asleep projector; anything
+        else raises BarcoAsleep while it's asleep.
+        """
+        if method in WAKE_METHODS:
+            await self._wake_command(method)
             return
         try:
             await self.check_connection()
