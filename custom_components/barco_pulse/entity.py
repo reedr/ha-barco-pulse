@@ -35,16 +35,26 @@ class BarcoEntity(CoordinatorEntity[BarcoCoordinator]):
         device = coordinator.device
         data = coordinator.data or {}
         self._attr_unique_id = f"{device.mac}_{description.key}"
-        self._attr_device_info = DeviceInfo(
+        # Only what's known: DeviceInfo overwrites the registry, and while the
+        # projector is asleep its identity hasn't been read yet.
+        info = DeviceInfo(
             identifiers={(DOMAIN, device.mac)},
             connections={(CONNECTION_NETWORK_MAC, format_mac(device.mac))},
             manufacturer=MANUFACTURER,
-            model=data.get(SYSTEM_MODEL),
-            serial_number=data.get(SYSTEM_SERIAL),
-            sw_version=data.get(SYSTEM_FIRMWARE),
-            name=data.get(SYSTEM_NAME) or "Barco projector",
+            default_name="Barco projector",
             configuration_url=f"http://{device.host}",
         )
+        for field, key in (
+            ("model", SYSTEM_MODEL),
+            ("serial_number", SYSTEM_SERIAL),
+            ("sw_version", SYSTEM_FIRMWARE),
+            ("name", SYSTEM_NAME),
+        ):
+            if data.get(key):
+                info[field] = data[key]
+        if "name" in info:
+            del info["default_name"]
+        self._attr_device_info = info
 
     async def _async_run(self, command: Awaitable[None]) -> None:
         """Run a command, reporting failures to the caller."""

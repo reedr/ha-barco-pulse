@@ -30,6 +30,7 @@ def fast_timing():
         patch(f"{module}.BARCO_RECONNECT_DELAY", 0.05),
         patch(f"{module}.BARCO_RECONNECT_DELAY_MAX", 0.1),
         patch(f"{module}.BARCO_WAKE_WINDOW", 3),
+        patch(f"{module}.BARCO_PENDING_TTL", 4),
     ):
         yield
 

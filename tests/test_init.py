@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
@@ -166,3 +167,48 @@ async def test_go_to_ready_wakes(hass: HomeAssistant, barco, wol) -> None:
             break
     assert barco.methods().count("system.gotoready") == 1
     assert hass.states.get("sensor.balder_cs_2590392444_state").state == "ready"
+
+
+async def test_stale_power_on_is_dropped(hass: HomeAssistant, barco) -> None:
+    """A power-on queued by a wake that never took isn't sent when the projector turns up later."""
+    await _setup(hass)
+    await barco.sleep()
+    await _settle(hass)
+    # This time the wake-on-LAN packet doesn't wake it.
+    with patch("custom_components.barco_pulse.device.send_magic_packet") as wol:
+        await hass.services.async_call(
+            "media_player", "turn_on", {"entity_id": PLAYER}, blocking=True
+        )
+        assert wol.call_count == 1
+    await asyncio.sleep(4.5)  # past BARCO_PENDING_TTL (patched to 4 s)
+    await barco.wake()
+    await _poll(hass)
+    assert entry_online(hass)
+    assert "system.poweron" not in barco.methods()
+    assert hass.states.get(PLAYER).state == "off"
+
+
+def entry_online(hass: HomeAssistant) -> bool:
+    return hass.config_entries.async_entries(DOMAIN)[0].runtime_data.device.online
+
+
+async def test_turn_off_while_asleep(hass: HomeAssistant, barco) -> None:
+    await _setup(hass)
+    await barco.sleep()
+    await _settle(hass)
+    await hass.services.async_call("media_player", "turn_off", {"entity_id": PLAYER}, blocking=True)
+    assert "system.poweroff" not in barco.methods()
+
+
+async def test_restart_while_asleep_keeps_identity(hass: HomeAssistant, barco) -> None:
+    entry = await _setup(hass)
+    await barco.stop()
+    await hass.config_entries.async_reload(entry.entry_id)
+    await _settle(hass)
+    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, MAC), entry.entry_id)
+    assert (device.name, device.model, device.sw_version) == (
+        "Balder CS-2590392444",
+        "Balder CS",
+        "2.5.2",
+    )
+    assert hass.states.get(PLAYER).attributes["friendly_name"] == "Balder CS-2590392444"

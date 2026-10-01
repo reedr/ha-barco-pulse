@@ -146,6 +146,7 @@ class BarcoDevice:
         self._authenticated = False
         # A wake method (WAKE_METHODS) to send once a woken projector is reachable.
         self._pending: str | None = None
+        self._pending_until = 0.0
         self._callback: Callable[[dict[str, Any]], None] | None = None
         self._listener: asyncio.Task | None = None
         self._keepalive: asyncio.Task | None = None
@@ -213,6 +214,8 @@ class BarcoDevice:
         """Connect and set up the session unless one is already up."""
         if self._is_connected():
             return
+        if self._closing:
+            raise BarcoConnectionError("Client closed")
         async with self._conn_lock:
             if self._is_connected():
                 return
@@ -277,6 +280,8 @@ class BarcoDevice:
         """Open and set up a session. Caller holds _conn_lock."""
         try:
             await self._open()
+            if self._closing:
+                raise BarcoConnectionError("Client closed")
             try:
                 await self._handshake()
             except BarcoAuthError as err:
@@ -295,8 +300,11 @@ class BarcoDevice:
             await self.send_request("image.source.list", NO_PARAMS)
             if self._pending is not None:
                 method, self._pending = self._pending, None
-                _LOGGER.info("%s is awake; sending %s", self.host, method)
-                await self.send_request(method, NO_PARAMS)
+                if time.monotonic() < self._pending_until:
+                    _LOGGER.info("%s is awake; sending %s", self.host, method)
+                    await self.send_request(method, NO_PARAMS)
+                else:
+                    _LOGGER.info("%s woke too late; not sending %s", self.host, method)
         except BaseException:
             if self._online:
                 self._connection_lost(reconnect=False)
@@ -371,7 +379,7 @@ class BarcoDevice:
         while not self._closing and not self._online:
             waking = time.monotonic() < self._wake_until
             if self._sleeping and not waking:
-                return
+                break
             await asyncio.sleep(const.BARCO_RECONNECT_DELAY if waking else delay)
             try:
                 await self.check_connection()
@@ -381,7 +389,7 @@ class BarcoDevice:
                 _LOGGER.info("Connected to %s", self.host)
                 return
             delay = min(delay * 2, const.BARCO_RECONNECT_DELAY_MAX)
-        if not self._online:
+        if not self._online and time.monotonic() >= self._pending_until:
             self._pending = None
 
     async def _keepalive_loop(self) -> None:
@@ -596,28 +604,41 @@ class BarcoDevice:
         _LOGGER.info("Waking %s (%s) with wake-on-LAN", self.host, self.mac)
         await asyncio.to_thread(send_magic_packet, self.mac)
         self._wake_until = time.monotonic() + const.BARCO_WAKE_WINDOW
+        # A reconnect loop deep in its backoff would sleep through the boot.
+        if self._reconnector is not None and not self._reconnector.done():
+            self._reconnector.cancel()
+        self._reconnector = None
         self._start_reconnect()
 
     async def _wake_command(self, method: str) -> None:
         """Send a wake method, waking the projector first if it's asleep or unreachable.
 
-        The method is sent once the woken projector accepts a connection.
+        The packet goes out straight away (harmless if the projector is merely
+        disconnected); the method is sent once it accepts a connection, if that
+        happens within BARCO_PENDING_TTL.
         """
-        if not self._online:
-            try:
-                await self.check_connection()
-            except BarcoConnectionError:
-                self._pending = method
-                await self._wake()
-                return
-        await self.send_request(method, NO_PARAMS)
+        if self._online:
+            await self.send_request(method, NO_PARAMS)
+            return
+        self._pending = method
+        self._pending_until = time.monotonic() + const.BARCO_PENDING_TTL
+        await self._wake()
 
     async def async_turn_on(self) -> None:
         """Power on, waking the projector first if needed."""
         await self._wake_command("system.poweron")
 
     async def async_turn_off(self) -> None:
-        """Power off (the projector goes to ready or eco, per its settings)."""
+        """Power off (the projector goes to ready or eco, per its settings).
+
+        Nothing to do if it's asleep or unreachable.
+        """
+        if not self._online:
+            try:
+                await self.check_connection()
+            except BarcoConnectionError as err:
+                _LOGGER.debug("%s is already off: %s", self.host, err)
+                return
         await self.async_command("system.poweroff", NO_PARAMS)
 
     async def async_select_source(self, source: str) -> None:

@@ -14,6 +14,7 @@ from .const import DOMAIN, UPDATE_INTERVAL
 from .device import (
     SYSTEM_FIRMWARE,
     SYSTEM_MODEL,
+    SYSTEM_NAME,
     SYSTEM_SERIAL,
     BarcoDevice,
     BarcoError,
@@ -65,7 +66,12 @@ class BarcoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _update_device_registry(self, data: dict[str, Any]) -> None:
         """Fill in model, serial and firmware once the projector has reported them."""
-        identity = (data.get(SYSTEM_MODEL), data.get(SYSTEM_SERIAL), data.get(SYSTEM_FIRMWARE))
+        identity = (
+            data.get(SYSTEM_MODEL),
+            data.get(SYSTEM_SERIAL),
+            data.get(SYSTEM_FIRMWARE),
+            data.get(SYSTEM_NAME),
+        )
         if identity == self._identity or not any(identity):
             return
         dev_reg = dr.async_get(self.hass)
@@ -75,10 +81,11 @@ class BarcoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if device is None:
             return
         self._identity = identity
-        model, serial, firmware = identity
+        model, serial, firmware, name = identity
         dev_reg.async_update_device(
             device.id,
             model=model or device.model,
             serial_number=serial or device.serial_number,
             sw_version=firmware or device.sw_version,
+            name=name or device.name,
         )
