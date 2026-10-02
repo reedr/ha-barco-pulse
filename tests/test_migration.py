@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -21,6 +23,20 @@ ENTITIES = {
     ("sensor", "system_state"): "barco_000d0a511b08_system_state",
     ("binary_sensor", "laser"): "barco_000d0a511b08_laser",
 }
+
+
+async def _wait_available(hass: HomeAssistant, entity_ids: list[str], timeout: float = 5) -> None:
+    """Wait for the fake projector's replies to arrive over the socket.
+
+    async_block_till_done() does not wait for socket I/O, so on a slow runner
+    the first readings can land just after it returns (CI flake 2026-10-02).
+    """
+    async with asyncio.timeout(timeout):
+        while any(
+            (state := hass.states.get(e)) is None or state.state == "unavailable"
+            for e in entity_ids
+        ):
+            await asyncio.sleep(0.05)
 
 
 def _legacy(hass: HomeAssistant) -> tuple[MockConfigEntry, str]:
@@ -77,6 +93,7 @@ async def test_import(hass: HomeAssistant, barco) -> None:
     assert hass.config_entries.async_get_entry(legacy.entry_id) is None
 
     ent_reg = er.async_get(hass)
+    await _wait_available(hass, [f"{d}.{o}" for (d, _), o in ENTITIES.items()])
     for (domain, key), object_id in ENTITIES.items():
         reg = ent_reg.async_get(f"{domain}.{object_id}")
         assert reg.platform == DOMAIN, reg.entity_id
@@ -141,4 +158,5 @@ async def test_resume_interrupted_import(hass: HomeAssistant, barco) -> None:
     assert dev_reg.async_get(stale.id) is None
     assert hass.config_entries.async_get_entry(legacy.entry_id) is None
     assert "legacy_entry" not in entry.data
+    await _wait_available(hass, ["sensor.barco_000d0a511b08_inlet_temp"])
     assert hass.states.get("sensor.barco_000d0a511b08_inlet_temp").state != "unavailable"
